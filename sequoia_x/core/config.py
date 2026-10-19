@@ -1,6 +1,25 @@
 """配置管理模块：通过 pydantic-settings 从环境变量或 .env 文件加载系统配置。"""
 
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class DailySignalConfig(BaseModel):
+    """收盘日线观察参数；阈值是研究假设，未校准收益。"""
+
+    support_window: int = Field(default=20, ge=2, le=250)
+    volume_window: int = Field(default=20, ge=2, le=250)
+    zone_volume_ratio: float = Field(default=2.0, gt=1, le=20)
+    zone_max_age: int = Field(default=20, ge=1, le=250)
+    max_active_zones: int = Field(default=16, ge=1, le=100)
+    trend_fast: int = Field(default=20, ge=2, le=250)
+    trend_slow: int = Field(default=60, ge=3, le=500)
+
+    @model_validator(mode="after")
+    def check_trend_windows(self):
+        if self.trend_fast >= self.trend_slow:
+            raise ValueError("trend_fast must be smaller than trend_slow")
+        return self
 
 
 class Settings(BaseSettings):
@@ -8,18 +27,19 @@ class Settings(BaseSettings):
     start_date: str = "2024-01-01"
     feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
     strategy_webhooks: dict[str, str] = {}
+    daily_signals: DailySignalConfig = Field(default_factory=DailySignalConfig)
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",  # <--- 加上这一行！让 Pydantic 放行未定义的变量
+        env_nested_delimiter="__",
     )
 
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]
         """扩展配置源，支持从环境变量中扫描 STRATEGY_WEBHOOK_ 前缀的键。"""
-        from pydantic_settings import EnvSettingsSource
         import os
 
         sources = super().settings_customise_sources(settings_cls, **kwargs)
@@ -29,12 +49,11 @@ class Settings(BaseSettings):
         webhooks: dict[str, str] = {}
         for key, value in os.environ.items():
             if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
+                strategy_key = key[len(prefix) :].lower()
                 webhooks[strategy_key] = value
 
         # 注入到初始化数据中（通过 init_kwargs source）
         if webhooks:
-            original_init = kwargs.get("init_settings")
             # 直接在 env 层注入，通过 model_post_init 处理
             os.environ.setdefault("_STRATEGY_WEBHOOKS_PARSED", "1")
             # 存储解析结果供 model_validator 使用
@@ -50,7 +69,7 @@ class Settings(BaseSettings):
         webhooks: dict[str, str] = dict(self.strategy_webhooks)
         for key, value in os.environ.items():
             if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
+                strategy_key = key[len(prefix) :].lower()
                 webhooks[strategy_key] = value
 
         # 使用 object.__setattr__ 绕过 pydantic 的不可变保护
