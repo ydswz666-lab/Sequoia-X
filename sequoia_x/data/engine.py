@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from sequoia_x.core.config import Settings
+from sequoia_x.core.daily_time import resolve_as_of
 from sequoia_x.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS stock_daily (
     close    REAL,
     volume   REAL,
     turnover REAL,
+    price_adjustment TEXT,
     UNIQUE (symbol, date)
 );
 """
@@ -30,10 +32,25 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_UPSERT_DAILY_SQL = """
+INSERT INTO stock_daily
+    (symbol, date, open, high, low, close, volume, turnover, price_adjustment)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(symbol, date) DO UPDATE SET
+    open = excluded.open,
+    high = excluded.high,
+    low = excluded.low,
+    close = excluded.close,
+    volume = excluded.volume,
+    turnover = excluded.turnover,
+    price_adjustment = excluded.price_adjustment;
+"""
+
 
 def _bs_fetch_batch(tasks: list) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。"""
     import baostock as bs
+
     bs.login()
     results = []
     for symbol, bs_code, start, end in tasks:
@@ -65,6 +82,10 @@ class DataEngine:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
+            if "price_adjustment" not in columns:
+                # Legacy rows have no provable price basis; never infer or relabel them.
+                conn.execute("ALTER TABLE stock_daily ADD COLUMN price_adjustment TEXT")
             conn.execute(_CREATE_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
@@ -77,13 +98,16 @@ class DataEngine:
             ).fetchone()
         return row[0] if row and row[0] else None
 
-    def get_ohlcv(self, symbol: str) -> pd.DataFrame:
+    def get_ohlcv(self, symbol: str, as_of: str | None = None) -> pd.DataFrame:
+        """Read ordered daily bars, optionally bounded by an inclusive ISO date."""
+        query = "SELECT * FROM stock_daily WHERE symbol = ?"
+        params = (symbol,)
+        if as_of is not None:
+            query += " AND date <= ?"
+            params = (symbol, as_of)
+        query += " ORDER BY date"
         with sqlite3.connect(self.db_path) as conn:
-            df = pd.read_sql(
-                "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
-                conn,
-                params=(symbol,),
-            )
+            df = pd.read_sql(query, conn, params=params)
         return df
 
     @staticmethod
@@ -99,7 +123,7 @@ class DataEngine:
         from datetime import date, timedelta
         from multiprocessing import Pool
 
-        today_str = date.today().strftime("%Y-%m-%d")
+        end_date = resolve_as_of(None)
 
         tasks = []
         with sqlite3.connect(self.db_path) as conn:
@@ -112,12 +136,13 @@ class DataEngine:
             return 0
 
         for symbol, last_date in rows:
-            if last_date and last_date >= today_str:
-                continue
-            start = today_str
+            start = end_date
             if last_date:
-                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
-            tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
+                next_date = (date.fromisoformat(last_date) + timedelta(days=1)).isoformat()
+                # Refresh the latest completed day even when already stored or a
+                # legacy unfinished/future row is present.
+                start = min(next_date, end_date)
+            tasks.append((symbol, self._to_baostock_code(symbol), start, end_date))
 
         if not tasks:
             logger.info("所有股票已是最新，无需更新")
@@ -139,17 +164,22 @@ class DataEngine:
             logger.info("无新数据（可能非交易日）")
             return 0
 
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
+        df = pd.DataFrame(
+            all_rows,
+            columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"],
+        )
+        # Defend against provider overflow beyond the requested closed-bar cutoff.
+        df = df.loc[df["date"] <= end_date].copy()
         for col in ["open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
+        df["price_adjustment"] = "hfq"
 
         count = len(df)
         with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            # A partial provider batch must never remove another symbol's history.
+            conn.executemany(_UPSERT_DAILY_SQL, df.itertuples(index=False, name=None))
             conn.commit()
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
@@ -161,14 +191,14 @@ class DataEngine:
         容错机制：
         - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
         - 每 200 只股票自动重连 baostock（防止长连接超时）
-        - 已入库的自动 skip，中断后可重跑续传
+        - 历史增量续传，最新完整日重新拉取并按股票/日期更新
         """
         import time
         from datetime import date, timedelta
 
         import baostock as bs
 
-        today_str = date.today().strftime("%Y-%m-%d")
+        end_date = resolve_as_of(None)
         max_retries = 3
         reconnect_interval = 200  # 每处理 N 只股票重连一次
 
@@ -190,14 +220,6 @@ class DataEngine:
         try:
             for i, symbol in enumerate(symbols):
                 last_date = self._get_last_date(symbol)
-                if last_date and last_date >= today_str:
-                    skipped += 1
-                    if (i + 1) % 500 == 0:
-                        logger.info(
-                            f"已处理 {i + 1}/{len(symbols)}，"
-                            f"成功 {success} 跳过 {skipped} 失败 {failed}"
-                        )
-                    continue
 
                 # 定期重连，防止长连接超时
                 since_reconnect += 1
@@ -211,7 +233,8 @@ class DataEngine:
 
                 start = last_date or self.start_date
                 if last_date:
-                    start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+                    next_date = (date.fromisoformat(last_date) + timedelta(days=1)).isoformat()
+                    start = min(next_date, end_date)
 
                 bs_code = self._to_baostock_code(symbol)
 
@@ -224,7 +247,7 @@ class DataEngine:
                             bs_code,
                             "date,open,high,low,close,volume,amount",
                             start_date=start,
-                            end_date=today_str,
+                            end_date=end_date,
                             frequency="d",
                             adjustflag="1",  # 后复权
                         )
@@ -261,6 +284,7 @@ class DataEngine:
                     continue
 
                 df = pd.DataFrame(rows, columns=rs.fields)
+                df = df.loc[df["date"] <= end_date].copy()
                 for col in ["open", "high", "low", "close", "volume", "amount"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                 df = df.dropna(subset=["close"])
@@ -271,17 +295,25 @@ class DataEngine:
                     continue
 
                 df["symbol"] = symbol
+                df["price_adjustment"] = "hfq"
                 df = df.rename(columns={"amount": "turnover"})
-                df = df[["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]]
+                df = df[
+                    [
+                        "symbol",
+                        "date",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "turnover",
+                        "price_adjustment",
+                    ]
+                ]
 
-                try:
-                    with sqlite3.connect(self.db_path) as conn:
-                        df.to_sql(
-                            "stock_daily", conn, if_exists="append",
-                            index=False, method="multi", chunksize=500,
-                        )
-                except sqlite3.IntegrityError:
-                    pass
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.executemany(_UPSERT_DAILY_SQL, df.itertuples(index=False, name=None))
+                    conn.commit()
 
                 success += 1
 
@@ -312,9 +344,9 @@ class DataEngine:
             symbols = []
             while rs.next():
                 row = rs.get_row_data()
-                code = row[0]           # "sh.600000" or "sz.000001"
-                status = row[4]         # "1" = 上市
-                stock_type = row[5]     # "1" = 股票
+                code = row[0]  # "sh.600000" or "sz.000001"
+                status = row[4]  # "1" = 上市
+                stock_type = row[5]  # "1" = 股票
                 if status == "1" and stock_type == "1":
                     symbols.append(code.split(".")[1])  # 提取纯数字代码
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
@@ -327,7 +359,5 @@ class DataEngine:
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT symbol FROM stock_daily"
-            ).fetchall()
+            rows = conn.execute("SELECT DISTINCT symbol FROM stock_daily").fetchall()
         return [row[0] for row in rows]
